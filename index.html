@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"><title>PLY viewer</title><link rel="icon" href="data:,">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { margin:0; background:#0c0d0f; color:#ddd; font:12px ui-monospace,Menlo,monospace; overflow:hidden; }
+  #bar { position:fixed; top:0; left:0; right:0; padding:8px 12px; background:#17191dcc; display:flex; gap:16px; align-items:center; flex-wrap:wrap; z-index:2; }
+  select, input[type=range], button { background:#24272d; color:#ddd; border:1px solid #424751; border-radius:4px; padding:4px 6px; font:inherit; }
+  button { cursor:pointer; } button:hover { background:#2e323a; }
+  input[type=range] { width:140px; padding:0; }
+  #status, label { color:#9299a5; }
+  #hint { position:fixed; bottom:8px; left:12px; right:12px; color:#9299a5; z-index:2; }
+  #cross { position:fixed; left:50%; top:50%; width:14px; height:14px; margin:-7px 0 0 -7px; pointer-events:none; z-index:2; display:none; }
+  #cross:before, #cross:after { content:''; position:absolute; background:#fff8; }
+  #cross:before { left:6px; top:0; width:2px; height:14px; } #cross:after { top:6px; left:0; width:14px; height:2px; }
+  body.fly #cross { display:block; }
+  #empty { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; color:#9299a5; line-height:1.8; z-index:1; pointer-events:none; }
+  #empty b { color:#ddd; }
+  body.drag:after { content:'drop to open'; position:fixed; inset:0; display:flex; align-items:center; justify-content:center; font-size:24px; color:#fff; background:#0c0d0fbb; border:2px dashed #9299a5; z-index:3; pointer-events:none; }
+  .progress { position:fixed; top:0; left:0; height:2px; background:#5b9cff; z-index:3; transition:width .2s; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "@mkkellogg/gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
+} }
+</script>
+</head>
+<body>
+<div id="bar">
+  <label>scene <select id="scene"><option value="">— choose —</option></select></label>
+  <button id="openbtn" title="open a local .ply / .ksplat / .splat">open file…</button>
+  <input id="file" type="file" accept=".ply,.ksplat,.splat" hidden>
+  <label><input id="flymode" type="checkbox"> fly</label>
+  <label>speed <input id="speed" type="range" min="0.5" max="30" step="0.5" value="4"> <span id="speedv">4</span> u/s</label>
+  <label>look <input id="sens" type="range" min="0.5" max="5" step="0.1" value="2"></label>
+  <label id="psizel" hidden>point size <input id="psize" type="range" min="0.2" max="6" step="0.1" value="1"></label>
+  <span id="status"></span>
+</div>
+<div class="progress" id="progress" style="width:0"></div>
+<div id="cross"></div>
+<div id="empty"><div><b>PLY viewer</b><br>pick a scene above, <b>open file…</b>, or drop a <b>.ply</b> / <b>.ksplat</b> / <b>.splat</b> onto the page<br>Gaussian splats and plain point clouds are both detected automatically<br><span style="opacity:.7">or link to any CORS-enabled file: <b>?url=https://…/scene.ply</b></span></div></div>
+<div id="hint"></div>
+<script type="module">
+import * as THREE from 'three';
+import * as GaussianSplats3D from '@mkkellogg/gaussian-splats-3d';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+const $ = id => document.getElementById(id);
+const sel = $('scene'), status = $('status'), hint = $('hint'), flyChk = $('flymode'), speedEl = $('speed'), speedV = $('speedv'), sensEl = $('sens'), psizeEl = $('psize'), psizeL = $('psizel'), progress = $('progress'), empty = $('empty');
+const setProgress = f => { progress.style.width = f == null ? '0' : (f * 100).toFixed(1) + '%'; };
+
+// ---------- format detection: a PLY with gaussian fields (f_dc_0 / opacity / scale_0) is a splat, otherwise a plain point cloud
+function sniffPlyHeader(bytes) {
+  const s = new TextDecoder().decode(bytes.subarray(0, Math.min(bytes.length, 65536)));
+  if (!s.startsWith('ply')) return null;
+  return /property\s+\w+\s+(f_dc_0|opacity|scale_0)\b/.test(s) ? 'splat' : 'points';
+}
+async function kindOf(url, name, file) {
+  const n = (name || url).toLowerCase().split('?')[0];
+  if (n.endsWith('.ksplat') || n.endsWith('.splat')) return 'splat';
+  let bytes;
+  if (file) bytes = new Uint8Array(await file.slice(0, 65536).arrayBuffer());
+  else { const r = await fetch(url, { headers: { Range: 'bytes=0-65535' } }); if (!r.ok) throw new Error(`HTTP ${r.status} fetching ${url}`); bytes = new Uint8Array(await r.arrayBuffer()); }
+  return sniffPlyHeader(bytes) || 'splat';
+}
+
+// ---------- plain point-cloud viewer (binary PLY: x y z + optional red green blue), same camera/controls interface as the splat viewer
+const PLY_SIZES = { char: 1, uchar: 1, int8: 1, uint8: 1, short: 2, ushort: 2, int16: 2, uint16: 2, int: 4, uint: 4, int32: 4, uint32: 4, float: 4, float32: 4, double: 8, float64: 8 };
+function parsePly(buf) {
+  const u8 = new Uint8Array(buf); let end = 0;
+  for (let i = 0; i < Math.min(u8.length, 65536) - 10; i++) if (u8[i] === 0x65 && String.fromCharCode(...u8.subarray(i, i + 10)) === 'end_header') { end = i + 10; break; }
+  while (u8[end] === 0x0d || u8[end] === 0x0a) end++;
+  const hdr = new TextDecoder().decode(u8.subarray(0, end)).split('\n'); let n = 0, props = [], stride = 0, fmt = 'binary_little_endian', inVertex = false;
+  for (const l of hdr) {
+    const t = l.trim().split(/\s+/);
+    if (t[0] === 'format') fmt = t[1];
+    else if (t[0] === 'element') { inVertex = t[1] === 'vertex'; if (inVertex) n = +t[2]; }
+    else if (t[0] === 'property' && inVertex) { if (t[1] === 'list') throw new Error('list properties on vertices are not supported'); props.push({ name: t[2], type: t[1], off: stride }); stride += PLY_SIZES[t[1]]; }
+  }
+  if (fmt === 'ascii') return parsePlyAscii(new TextDecoder().decode(u8.subarray(end)), n, props);
+  const le = fmt !== 'binary_big_endian';
+  const P = Object.fromEntries(props.map(p => [p.name, p])), dv = new DataView(buf, end);
+  const pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+  const rd = (p, o) => { const t = p.type; return t === 'float' || t === 'float32' ? dv.getFloat32(o + p.off, le) : t === 'double' || t === 'float64' ? dv.getFloat64(o + p.off, le)
+    : t === 'uchar' || t === 'uint8' ? dv.getUint8(o + p.off) : t === 'char' || t === 'int8' ? dv.getInt8(o + p.off) : t === 'ushort' || t === 'uint16' ? dv.getUint16(o + p.off, le)
+    : t === 'short' || t === 'int16' ? dv.getInt16(o + p.off, le) : t === 'uint' || t === 'uint32' ? dv.getUint32(o + p.off, le) : dv.getInt32(o + p.off, le); };
+  const [px, py, pz] = [P.x, P.y, P.z], cr = P.red || P.r || P.diffuse_red, cg = P.green || P.g || P.diffuse_green, cb = P.blue || P.b || P.diffuse_blue;
+  const cs = !cr ? 0 : cr.type.startsWith('f') || cr.type.startsWith('d') ? 1 : cr.type.includes('16') || cr.type === 'ushort' || cr.type === 'short' ? 1 / 65535 : 1 / 255;
+  for (let i = 0, o = 0; i < n; i++, o += stride) {
+    pos[3*i] = rd(px, o); pos[3*i+1] = rd(py, o); pos[3*i+2] = rd(pz, o);
+    if (cr) { col[3*i] = rd(cr, o) * cs; col[3*i+1] = rd(cg, o) * cs; col[3*i+2] = rd(cb, o) * cs; } else col[3*i] = col[3*i+1] = col[3*i+2] = 0.8;
+  }
+  return { n, pos, col };
+}
+function parsePlyAscii(text, n, props) {
+  const ix = Object.fromEntries(props.map((p, i) => [p.name, i])), pos = new Float32Array(n * 3), col = new Float32Array(n * 3);
+  const cr = ix.red ?? ix.r, cg = ix.green ?? ix.g, cb = ix.blue ?? ix.b, cs = cr == null ? 0 : props[cr].type.startsWith('f') ? 1 : 1 / 255;
+  const lines = text.split('\n'); let i = 0;
+  for (const l of lines) { if (i >= n) break; const t = l.trim().split(/\s+/); if (t.length < 3) continue;
+    pos[3*i] = +t[ix.x]; pos[3*i+1] = +t[ix.y]; pos[3*i+2] = +t[ix.z];
+    if (cr != null) { col[3*i] = t[cr] * cs; col[3*i+1] = t[cg] * cs; col[3*i+2] = t[cb] * cs; } else col[3*i] = col[3*i+1] = col[3*i+2] = 0.8; i++; }
+  return { n: i, pos, col };
+}
+class PointsViewer {
+  constructor() {
+    this.isPoints = true; this.renderer = new THREE.WebGLRenderer({ antialias: false }); this.renderer.setPixelRatio(window.devicePixelRatio || 1);
+    this.renderer.setSize(innerWidth, innerHeight); this.renderer.setClearColor(0x0c0d0f); document.body.appendChild(this.renderer.domElement);
+    this.scene = new THREE.Scene(); this.camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.02, 5000);
+    this.camera.up.set(0, 0, 1); this.camera.position.set(-2, 0, 0.3);
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement); this.controls.target.set(2, 0, 0.3); this.controls.update();
+    this.raycaster = new THREE.Raycaster(); this.raycaster.params.Points.threshold = 0.04;
+    this.points = null; this.baseSize = 0.02;
+    this._onResize = () => { this.camera.aspect = innerWidth / innerHeight; this.camera.updateProjectionMatrix(); this.renderer.setSize(innerWidth, innerHeight); };
+    window.addEventListener('resize', this._onResize);
+    const loop = () => { this._raf = requestAnimationFrame(loop); if (this.controls.enabled) this.controls.update(); this.renderer.render(this.scene, this.camera); }; loop();
+  }
+  async load(url, onProgress) {
+    const r = await fetch(url); if (!r.ok) throw new Error(`HTTP ${r.status} fetching ${url}`);
+    const total = +r.headers.get('Content-Length') || 0, reader = r.body.getReader(), chunks = []; let got = 0;
+    while (true) { const { done, value } = await reader.read(); if (done) break; chunks.push(value); got += value.length; if (onProgress) onProgress(got, total); }
+    const buf = new Uint8Array(got); let o = 0; for (const c of chunks) { buf.set(c, o); o += c.length; }
+    const { n, pos, col } = parsePly(buf.buffer); this.n = n;
+    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(pos, 3)); g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+    g.computeBoundingBox(); this.bbox = g.boundingBox;
+    // point size scales with the scene so a 10-unit site and a 1000-unit site both look right
+    const span = this.bbox.getSize(new THREE.Vector3()).length(); this.baseSize = Math.max(0.002, span / 900); this.raycaster.params.Points.threshold = span / 300;
+    this.material = new THREE.PointsMaterial({ size: this.baseSize * parseFloat(psizeEl.value), vertexColors: true, sizeAttenuation: true });
+    this.points = new THREE.Points(g, this.material); this.scene.add(this.points);
+  }
+  setSize(mult) { if (this.material) this.material.size = this.baseSize * mult; }
+  // default view: from the -X side, slightly above the centre, looking at the bbox centre
+  frame() {
+    const c = this.bbox.getCenter(new THREE.Vector3()), s = this.bbox.getSize(new THREE.Vector3()), d = Math.max(s.x, s.y, s.z);
+    this.camera.near = d / 2000; this.camera.far = d * 50; this.camera.updateProjectionMatrix();
+    this.camera.position.set(c.x - d * 0.9, c.y - d * 0.4, c.z + d * 0.45); this.controls.target.copy(c); this.controls.update();
+  }
+  getSplatMesh() { return { getSplatCount: () => this.n }; }
+  getRenderDimensions(v) { v.set(innerWidth, innerHeight); }
+  start() {}
+  dispose() { cancelAnimationFrame(this._raf); window.removeEventListener('resize', this._onResize); this.controls.dispose(); if (this.points) { this.points.geometry.dispose(); this.material.dispose(); } this.renderer.dispose(); this.renderer.domElement.remove(); }
+}
+try { psizeEl.value = localStorage.getItem('pointSize') || psizeEl.value; } catch (e) {}
+psizeEl.oninput = () => { if (viewer && viewer.isPoints) viewer.setSize(parseFloat(psizeEl.value)); try { localStorage.setItem('pointSize', psizeEl.value); } catch (e) {} };
+const HINT_FLY = 'fly: click the view to capture the mouse (Esc frees it) · mouse = look · WASD fly along facing · Space up · Shift down · Ctrl = 4x · release keys to drift to a stop';
+const HINT_ORBIT = 'orbit: drag = orbit · right-drag = pan · scroll = zoom · click a surface = orbit around that point (Alt-click also flies to it) · F = centre under cursor · WASD fly · E/Space up · Q down · Shift 4x';
+try { speedEl.value = localStorage.getItem('flySpeed') || speedEl.value; sensEl.value = localStorage.getItem('lookSens') || sensEl.value; flyChk.checked = (localStorage.getItem('flyMode') ?? '0') === '1'; } catch (e) {}
+speedV.textContent = speedEl.value;
+speedEl.oninput = () => { speedV.textContent = speedEl.value; try { localStorage.setItem('flySpeed', speedEl.value); } catch (e) {} };
+sensEl.oninput = () => { try { localStorage.setItem('lookSens', sensEl.value); } catch (e) {} };
+
+// ---------- scene manifest (scenes.json): [{label, name, file | files:[chunks], kind?, camera?:{position,lookAt}, note?}]
+let scenes = [];
+try { scenes = await (await fetch('scenes.json', { cache: 'no-cache' })).json(); } catch (e) {}
+{
+  const groups = new Map();
+  scenes.forEach((s, i) => {
+    if (!groups.has(s.label)) { const g = document.createElement('optgroup'); g.label = s.label; groups.set(s.label, g); sel.appendChild(g); }
+    const o = document.createElement('option'); o.value = 'scene:' + i; o.textContent = s.name + (s.kind ? '  [' + s.kind + ']' : ''); groups.get(s.label).appendChild(o);
+  });
+}
+let viewer = null;
+
+// ---------- input state
+const pressed = new Set();
+window.addEventListener('keydown', e => { if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT' || e.target.tagName === 'BUTTON') return; pressed.add(e.key.toLowerCase()); if (e.key === ' ') e.preventDefault(); });
+window.addEventListener('keyup', e => pressed.delete(e.key.toLowerCase()));
+window.addEventListener('blur', () => pressed.clear());
+const UP = new THREE.Vector3(0, 0, 1);
+
+// ---------- fly mode: pointer lock, yaw/pitch from mouse, velocity with drift
+let yaw = 0, pitch = 0, locked = false;
+const vel = new THREE.Vector3(), wish = new THREE.Vector3(), fwd = new THREE.Vector3(), right = new THREE.Vector3(), flat = new THREE.Vector3();
+function flyActive() { return flyChk.checked && viewer && viewer.camera; }
+function syncAnglesFromCamera() {
+  const cam = viewer.camera; cam.getWorldDirection(fwd);
+  yaw = Math.atan2(fwd.y, fwd.x); pitch = Math.asin(THREE.MathUtils.clamp(fwd.z, -1, 1));
+}
+function setMode() {
+  document.body.classList.toggle('fly', flyChk.checked);
+  hint.textContent = flyChk.checked ? HINT_FLY : HINT_ORBIT;
+  try { localStorage.setItem('flyMode', flyChk.checked ? '1' : '0'); } catch (e) {}
+  if (!viewer) return;
+  viewer.controls.enabled = !flyChk.checked;
+  if (flyChk.checked) syncAnglesFromCamera(); else if (document.pointerLockElement) document.exitPointerLock();
+}
+flyChk.onchange = setMode;
+document.addEventListener('pointerlockchange', () => { locked = !!document.pointerLockElement; });
+window.addEventListener('mousemove', e => {
+  if (!locked || !flyActive()) return;
+  const s = 0.0012 * parseFloat(sensEl.value);
+  yaw -= e.movementX * s; pitch = THREE.MathUtils.clamp(pitch - e.movementY * s, -1.55, 1.55);
+});
+window.addEventListener('pointerdown', e => {
+  if (flyActive() && e.button === 0 && e.target.tagName === 'CANVAS' && !locked) { e.target.requestPointerLock(); }
+});
+
+// ---------- orbit mode: click on the surface = move the orbit centre there
+const mouse = new THREE.Vector2(), dims = new THREE.Vector2(), hits = [];
+let downAt = null;
+function surfaceUnderCursor() {
+  if (viewer && viewer.isPoints) {
+    if (!viewer.points) return null;
+    const ndc = new THREE.Vector2((mouse.x / innerWidth) * 2 - 1, -(mouse.y / innerHeight) * 2 + 1);
+    viewer.raycaster.setFromCamera(ndc, viewer.camera); const h = viewer.raycaster.intersectObject(viewer.points, false);
+    return h.length ? h[0].point.clone() : null;
+  }
+  if (!viewer || !viewer.splatMesh || !viewer.raycaster) return null;
+  viewer.getRenderDimensions(dims);
+  viewer.raycaster.setFromCameraAndScreenPosition(viewer.camera, mouse, dims);
+  hits.length = 0; viewer.raycaster.intersectSplatMesh(viewer.splatMesh, hits);
+  return hits.length ? hits[0].origin.clone() : null;
+}
+function focusOn(p, approach) {
+  const ctl = viewer.controls, cam = viewer.camera;
+  if (approach) { const d = cam.position.clone().sub(p); const keep = Math.max(0.5, d.length() * 0.3); cam.position.copy(p).addScaledVector(d.normalize(), keep); }
+  ctl.target.copy(p); ctl.update();
+  status.textContent = `centre → ${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}`;
+}
+window.addEventListener('pointermove', e => mouse.set(e.clientX, e.clientY));
+window.addEventListener('pointerdown', e => { if (!flyActive() && e.button === 0 && e.target.tagName === 'CANVAS') downAt = [e.clientX, e.clientY, performance.now()]; });
+window.addEventListener('pointerup', e => {
+  if (!downAt || e.button !== 0) return;
+  const moved = Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]), held = performance.now() - downAt[2]; downAt = null;
+  if (moved > 4 || held > 400) return;
+  mouse.set(e.clientX, e.clientY); const p = surfaceUnderCursor(); if (p) focusOn(p, e.altKey);
+});
+window.addEventListener('keydown', e => { if (!flyActive() && (e.key === 'f' || e.key === 'F')) { const p = surfaceUnderCursor(); if (p) focusOn(p, e.shiftKey); } });
+
+// ---------- per-frame movement
+let last = performance.now();
+function tick(now) {
+  requestAnimationFrame(tick);
+  const dt = Math.min((now - last) / 1000, 0.1); last = now;
+  if (!viewer || !viewer.camera) return;
+  const cam = viewer.camera, ctl = viewer.controls, speed = parseFloat(speedEl.value);
+  if (flyChk.checked) {
+    // facing from yaw/pitch (Z-up); WASD moves horizontally along facing, Space/Shift move on world Z
+    fwd.set(Math.cos(pitch) * Math.cos(yaw), Math.cos(pitch) * Math.sin(yaw), Math.sin(pitch));
+    flat.set(Math.cos(yaw), Math.sin(yaw), 0); right.crossVectors(flat, UP);
+    wish.set(0, 0, 0);
+    if (locked || pressed.size) {
+      if (pressed.has('w') || pressed.has('arrowup')) wish.add(flat);
+      if (pressed.has('s') || pressed.has('arrowdown')) wish.sub(flat);
+      if (pressed.has('d') || pressed.has('arrowright')) wish.add(right);
+      if (pressed.has('a') || pressed.has('arrowleft')) wish.sub(right);
+      if (pressed.has(' ') || pressed.has('e')) wish.z += 1;
+      if (pressed.has('shift') || pressed.has('q')) wish.z -= 1;
+    }
+    const boost = pressed.has('control') ? 4 : 1;
+    if (wish.lengthSq() > 0) wish.normalize().multiplyScalar(speed * boost);
+    // accelerate toward the wished velocity, drift to a stop when released
+    const k = 1 - Math.exp(-dt * (wish.lengthSq() > 0 ? 12 : 6));
+    vel.lerp(wish, k);
+    cam.position.addScaledVector(vel, dt);
+    cam.up.copy(UP);
+    ctl.target.copy(cam.position).add(fwd);   // keep OrbitControls consistent so its update() doesn't fight us
+    cam.lookAt(ctl.target);
+  } else if (pressed.size) {
+    // orbit mode: WASD along the view direction, E/Space up, Q down, Shift = 4x
+    const s = speed * (pressed.has('shift') ? 4 : 1) * dt;
+    cam.getWorldDirection(fwd); right.crossVectors(fwd, UP).normalize(); wish.set(0, 0, 0);
+    if (pressed.has('w') || pressed.has('arrowup')) wish.addScaledVector(fwd, s);
+    if (pressed.has('s') || pressed.has('arrowdown')) wish.addScaledVector(fwd, -s);
+    if (pressed.has('d') || pressed.has('arrowright')) wish.addScaledVector(right, s);
+    if (pressed.has('a') || pressed.has('arrowleft')) wish.addScaledVector(right, -s);
+    if (pressed.has('e') || pressed.has(' ')) wish.addScaledVector(UP, s);
+    if (pressed.has('q')) wish.addScaledVector(UP, -s);
+    if (wish.lengthSq() > 0) { cam.position.add(wish); ctl.target.add(wish); }
+  }
+}
+requestAnimationFrame(tick);
+
+// ---------- loading
+// A scene split into <100 MB chunks (GitHub Pages limit) is fetched in order and stitched into one blob before the splat loader sees it.
+async function fetchStitched(urls, onProgress) {
+  const parts = []; let got = 0, total = 0;
+  const heads = await Promise.all(urls.map(u => fetch(u, { method: 'HEAD' }).then(r => +r.headers.get('Content-Length') || 0).catch(() => 0)));
+  total = heads.reduce((a, b) => a + b, 0);
+  for (const u of urls) {
+    const r = await fetch(u); if (!r.ok) throw new Error(`HTTP ${r.status} fetching ${u}`);
+    const reader = r.body.getReader();
+    while (true) { const { done, value } = await reader.read(); if (done) break; parts.push(value); got += value.length; onProgress(got, total); }
+  }
+  return new Blob(parts);
+}
+const FORMAT = { ply: GaussianSplats3D.SceneFormat.Ply, splat: GaussianSplats3D.SceneFormat.Splat, ksplat: GaussianSplats3D.SceneFormat.KSplat };
+const extOf = n => { const m = (n || '').toLowerCase().split('?')[0].match(/\.(ply|splat|ksplat)$/); return m ? m[1] : 'ply'; };
+let objectUrl = null;
+async function open({ name, url, urls, file, kind, camera }) {
+  if (viewer) { await viewer.dispose(); viewer = null; }
+  if (objectUrl) { URL.revokeObjectURL(objectUrl); objectUrl = null; }
+  empty.style.display = 'none'; setProgress(0);
+  const label = name || (url || '').split('/').pop();
+  const srcName = file ? file.name : (urls ? urls[0] : url);   // the real file name/URL decides the format, not the display name
+  const prog = (got, total) => { setProgress(total ? got / total : null); status.textContent = `loading ${label} … ${(got / 1048576).toFixed(0)}${total ? ' / ' + (total / 1048576).toFixed(0) : ''} MB`; };
+  status.textContent = 'loading ' + label + ' …';
+  try {
+    if (file) { objectUrl = URL.createObjectURL(file); url = objectUrl; }
+    else if (urls) { objectUrl = URL.createObjectURL(await fetchStitched(urls, prog)); url = objectUrl; }
+    kind = kind || await kindOf(url, srcName, file);
+    psizeL.hidden = kind !== 'points';
+    if (kind === 'points') {
+      viewer = new PointsViewer();
+      await viewer.load(url, prog);
+      viewer.frame(); applyCamera(camera); setMode();
+      status.textContent = `${label} · ${viewer.n.toLocaleString()} points`;
+    } else {
+      const cam = camera || { position: [-2, 0, 0.3], lookAt: [2, 0, 0.3] };
+      viewer = new GaussianSplats3D.Viewer({
+        cameraUp: [0, 0, 1], initialCameraPosition: cam.position, initialCameraLookAt: cam.lookAt,
+        sharedMemoryForWorkers: false, gpuAcceleratedSort: false, sphericalHarmonicsDegree: 2,
+        dynamicScene: false, freeIntermediateSplatData: true,
+      });
+      viewer.checkForFocalPointChange = () => {};  // built-in click focus is too strict (2px); ours runs instead
+      const fmt = FORMAT[extOf(srcName.replace(/\.part\d+$/, ''))];
+      await viewer.addSplatScene(url, { format: fmt, splatAlphaRemovalThreshold: 5, showLoadingUI: true, progressiveLoad: true, onProgress: (p) => { if (p != null) setProgress(p / 100); } });
+      viewer.start(); setMode();
+      const v = viewer, refresh = () => { if (viewer !== v) return; const n = v.getSplatMesh().getSplatCount(), busy = v.isLoadingOrUnloading && v.isLoadingOrUnloading(); if (!/^centre/.test(status.textContent)) status.textContent = `${label} · ${n.toLocaleString()} splats${busy ? ' · loading…' : ''}`; if (busy) setTimeout(refresh, 500); else setProgress(null); };
+      refresh();
+    }
+  } catch (e) {
+    status.textContent = `could not open ${label}: ${e.message || e}`; empty.style.display = ''; console.error(e);
+  }
+  setProgress(null);
+}
+function applyCamera(cam) {
+  if (!cam || !viewer) return;
+  viewer.camera.position.fromArray(cam.position); viewer.controls.target.fromArray(cam.lookAt); viewer.controls.update();
+}
+sel.onchange = () => {
+  const v = sel.value; if (!v.startsWith('scene:')) return;
+  const s = scenes[+v.slice(6)];
+  const base = s.files ? s.files : [s.file];
+  const u = new URL(location.href); u.searchParams.delete('url'); u.searchParams.set('scene', s.id || s.name); history.replaceState(null, '', u);
+  open({ name: s.name, url: s.files ? undefined : s.file, urls: s.files ? base : undefined, kind: s.kind, camera: s.camera });
+};
+$('openbtn').onclick = () => $('file').click();
+$('file').onchange = e => { const f = e.target.files[0]; if (f) { sel.value = ''; open({ name: f.name, file: f }); } };
+window.addEventListener('dragover', e => { e.preventDefault(); document.body.classList.add('drag'); });
+window.addEventListener('dragleave', e => { if (!e.relatedTarget) document.body.classList.remove('drag'); });
+window.addEventListener('drop', e => { e.preventDefault(); document.body.classList.remove('drag'); const f = e.dataTransfer.files[0]; if (f) { sel.value = ''; open({ name: f.name, file: f }); } });
+
+setMode();
+const q = new URLSearchParams(location.search);
+if (q.get('url')) open({ url: q.get('url') });
+else {
+  const want = q.get('scene'); const i = scenes.findIndex(s => (s.id || s.name) === want);
+  if (i >= 0) { sel.value = 'scene:' + i; sel.onchange(); }
+  else if (scenes.length && !q.has('empty')) { sel.value = 'scene:0'; sel.onchange(); }
+}
+</script>
+</body>
+</html>

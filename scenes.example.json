@@ -1,0 +1,9 @@
+[
+  { "label": "my site", "id": "site_points", "name": "point cloud", "kind": "points",
+    "file": "scenes/site/points.ply",
+    "camera": { "position": [-6, 1, 0.3], "lookAt": [0, 0, -0.5] } },
+  { "label": "my site", "id": "site_splat", "name": "splat", "kind": "splat",
+    "file": "scenes/site/splat.ply" },
+  { "label": "my site", "id": "site_splat_chunked", "name": "splat (chunked for GitHub Pages)", "kind": "splat",
+    "files": ["scenes/site/scene.ksplat.part0", "scenes/site/scene.ksplat.part1"] }
+]

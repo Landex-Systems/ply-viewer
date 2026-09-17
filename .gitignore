@@ -1,0 +1,6 @@
+# your scene files live in scenes/ but are not committed (GitHub refuses files over 100 MB anyway)
+scenes/**/*.ply
+scenes/**/*.ksplat
+scenes/**/*.ksplat.part*
+scenes/**/*.splat
+.DS_Store
